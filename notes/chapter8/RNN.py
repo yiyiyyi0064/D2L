@@ -13,7 +13,7 @@ train_iter,  vocab = d2l.load_data_time_machine(batch_size, num_steps)
 F.one_hot(torch.tensor([0,2]),len(vocab))
 
 #初始化模型参数
-def get_paramss(vocab_size, num_hiddens, device):
+def get_params(vocab_size, num_hiddens, device):
     #输入输出与vocab_size 相同 要从相同的词表中去进行转换
     num_inputs = num_outputs = vocab_size 
 
@@ -47,4 +47,50 @@ def rnn(inputs, state, params):
         Y = torch.mm(H,W_hq)+b_q
         outputs.append(Y)
     return torch.cat(outputs, dim=0), (H,)
+
+class RNNModelScratch:
+    def __init__(self, vocab_size, num_hiddens, device, 
+                    get_params, init_state, forward_fn):
+        self.vocab_size, self.num_hiddens = vocab_size, num_hiddens
+        self.params = get_params(vocab, num_hiddens, device)
+        self.init_state, self.forward_fn = init_state, forward_fn
+
+    def __call__(self, X, state):
+        X = F.one_hot(X.T, self.vocab_size).type(torch.float32)
+        #要返回参数
+        return self.forward_fn(X, state, self.params)
+    def begin_state(self, batch_size, device):
+        return self.init_state(batch_size, self.num_hiddens, device)
+    
+def predict(prefix, num_preds, net, vocab, device):
+    """在prefix后面生成新字符"""
+    state = net.begin_state(batch_size=1, device=device)
+    outputs = [vocab[prefix]]
+    get_input = lambda: torch.tensor([outputs[-1]],device=device).reshape((1,1))
+    #预热 即将Hidden隐状态H调整为上下文值
+    for y in prefix[1:]:
+        #更新H 每次预测结果直接丢弃
+        _, state = net(get_input(), state)
+        outputs.append(vocab[y])
+    #进行预测
+    for _ in range(num_preds):
+        y, state = net(get_input(), state)
+        #y.argmax(dim=1) 模型输出为概率分布 max取概率最大那个字符
+        #预测出来的y存入outputs 说明下一次循环调用get_input时，会把自己说的话当成输出
+        outputs.append(int(y.argmax(dim=1)).reshape(1))
+    return ''.join([vocab.idx_to_token[i] for i in outputs])
+
+
+
+if __name__ == '__main__':
+    num_hiddens = 512
+    X = torch.arange(10).reshape((2, 5))
+    F.one_hot(X.T, 28).shape
+    #检查输出形状是否正确
+    net = RNNModelScratch(len(28), num_hiddens, d2l.try_gpu(),
+                          get_params, init_rnn_state, rnn)
+    state = net.begin_state(X.shape[0], d2l.try_gpu())
+    Y, new_state = net(X.to(d2l.try_gpu()), state)
+    Y.shape, len(new_state), new_state[0].shape
+
 
