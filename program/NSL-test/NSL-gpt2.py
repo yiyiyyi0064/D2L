@@ -3,7 +3,10 @@ import torch
 import time
 import math
 torch.set_printoptions(8)
-#
+#全局定义kv_cache
+kv_cache = []
+#当前inference 在哪一层
+current_layer_idx = 0
 def params_to_torch(params):
     """递归将字典中的 numpy 数组转换为 torch Tensor"""
     for k, v in params.items():
@@ -103,11 +106,12 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
             mlp: dictionary that load from gpt2 weight. w_b1 and w_b2 are the params of two linear layer
         Output: Tensor
     """
+    global current_layer_idx
     d_k = k.size(-1) #最后一个dimension是d_model
-    #这里实现self-attention 计算部分 其中mask应该是可选添加
-    #K 需要先转置  
+    
+
+    #attention计算部分更新
     scores = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(d_k)
-    #看是否需要mask
     #if mask == True :
         #加一个右上角矩阵就行 softmax之后会无限趋近于0
         #scores = scores.masked_fill(mask == 0, -1e9)
@@ -128,8 +132,10 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             n_head: number of head
         Output: Tensorying multi-head attention and linear transformation, shape [n_seq, n_embd].
     """
+    global current_layer_idx
     c_attn, c_proj = attn['c_attn'], attn['c_proj']
     # qkv projection
+    #现在的 x [1, n_embd] -> [1, 3*n_embd] -> qkv [3, 1, n_embd] 
     x = linear(x, c_attn)  # [n_seq, n_embd] -> [n_seq, 3*n_embd]
     
     # Split into qkv
@@ -142,7 +148,27 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     #直接使用split 沿着最后一个dim分就行
     n_embd = x.size(-1) // 3
     qkv = torch.split(x, n_embd ,dim= -1)
-
+    #实现KV_Cache: 现在input输入的x是当前token的embedding 经过线性变换之后得到qkv 其中k、v是当前token的k、v 
+    #KV_Cache实现
+    #看了每个block按顺序从params中取出参数 在每一个block中使用的参数只是当前block中的 没有其他layer的
+    #但是kv_cache 是全局的话 要取出就需要一个index or 一个顺序 <- 这里有自然继承顺序（就是按照block 所以无需担心）
+    #故kv_cache 的数据结构选择为list 
+    k = qkv[1] #当前token的k
+    v = qkv[2] #当前token的v
+    if current_layer_idx >= len(kv_cache):
+        #Prefill: 如果当前层的kv_cache还没有 就先放进去
+        kv_cache.append([k.detach(), v.detach()])
+    else:
+        #若存在，取出past，再拼接新的k、v
+        past_k, past_v = kv_cache[current_layer_idx]
+        k = torch.cat([past_k, k], dim=0)
+        v = torch.cat([past_v, v], dim=0) #按照seq顺序拼接
+        #更新kv_cache
+        kv_cache[current_layer_idx] = [k.detach(), v.detach()]
+    #更新当前层的kv_cache index
+    current_layer_idx += 1
+    #更新qkv
+    qkv = [qkv[0], k, v]
     # Split into heads
     qkv_heads = [qkv_part.chunk(n_head, dim=-1) for qkv_part in qkv]  # 3 * [n_seq, n_embd] -> 3 * n_head * [n_seq, n_embd/n_head]
     qkv_heads = list(zip(*qkv_heads))  # [3, n_head, n_seq, n_embd/n_head]
@@ -158,11 +184,25 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             | 0    0    0  ...   0  |
         Mask is a tensor whose dimension is [n_seq, n_seq]
     """
-    #好吧，直接在这里实现
-    #causal_mask = None # need to modify
-    n_seq = x.size(-2)
-    causal_mask = torch.full((n_seq,n_seq), float('-inf'))
-    causal_mask = torch.triu(causal_mask, diagonal=1)
+    #causal_mask = None # need to 
+    #获取当前输入序列长度 
+    #这里有两种可能：
+    n_seq = x.size(0)
+    #为了构造mask 需要知道当前一共输入了多少token
+    #1. Prefill阶段 输入的是整个prompt n_seq = x.size 
+    if current_layer_idx >= len(kv_cache):
+        total_seq_len = n_seq
+    #2.Decode阶段 输入的是当前token的embedding  n_seq = 1
+    else: #之前token数+当前token数 current_layer_idx+1 已经更新了
+        total_seq_len = kv_cache[current_layer_idx-1][0].size(0) 
+    #生成mask
+    if n_seq > 1:
+        causal_mask = torch.full((n_seq,n_seq), float('-inf'))
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+    else:
+        #说明是decode阶段 只输入了一个token 没有后面的token 故直接返回全0矩阵即可
+        causal_mask = torch.zeros((1, total_seq_len))
+    
     # Perform attention over each head
     out_heads = [attention(q, k, v, causal_mask) for q, k, v in qkv_heads]  # n_head * [n_seq, n_embd/n_head]
     
@@ -191,14 +231,27 @@ def transformer_block(x, block, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
 
     return x
 
-
+#forward 每次生成一个token 
+#加入kv_cache后 input分为 prompt 和 token
+#即传给transformer的输入是 prompt or token
 def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
+    #每次推理都要重置current_layer_idx
+    global current_layer_idx
+    current_layer_idx = 0
     wte, wpe, blocks, ln_f = params['wte'], params['wpe'], params['blocks'], params['ln_f']
     # token + positional embeddings
-    x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
-    
+    #由于输入的inputs是token id 需要先通过wte和wpe转换成embedding
+    if len(kv_cache) > 0: 
+        #只要有cache了 那么当前开始时所有layer的cache的长度都一样
+        curr_pos = kv_cache[0][0].size(0) #当前输入的token位置
+    else:
+        curr_pos = 0 #说明是prefill阶段 输入的是整个prompt 从0开始
+    #tensor
+    input_tensor = torch.Tensor(inputs).long() # [n_seq]
+    x = wte[input_tensor] + wpe[curr_pos:curr_pos + len(inputs)]  # [n_seq] -> [n_seq, n_embd]
     x = torch.Tensor(x)
     # forward pass through n_layer transformer blocks
+    #按顺序取参数
     for block in blocks:
         x = transformer_block(x, block, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
@@ -209,9 +262,16 @@ def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
 
 def generate(inputs, params, n_head, n_tokens_to_generate):
     from tqdm import tqdm
+    #分为Prefill阶段和Decode阶段
+    #Prefill阶段：输入是整个prompt 生成第一个token
+    logits = gpt2(inputs, params, n_head=n_head)  # model forward pass
+    next_id = np.argmax(logits[-1])  # greedy sampling
+    inputs.append(int(next_id))  # append prediction to input
 
-    for _ in tqdm(range(n_tokens_to_generate), "generating"):  # auto-regressive decode loop
-        logits = gpt2(inputs, params, n_head=n_head)  # model forward pass
+    #Decode阶段：输入是当前token的embedding 生成下一个token
+    for _ in tqdm(range(n_tokens_to_generate-1), "generating"):  # auto-regressive decode loop
+        #这里只需要传入最后一个token的id
+        logits = gpt2([next_id], params, n_head=n_head)  # model forward pass
         next_id = np.argmax(logits[-1])  # greedy sampling
         inputs.append(int(next_id))  # append prediction to input
 
