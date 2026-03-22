@@ -240,17 +240,22 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
     while len(results) < n_tokens_to_generate   :
         #添加一个inputs_draft 用于draft模型的输入 这样就可以避免直接修改inputs 这样就不需要rollback了
         inputs_draft = list(inputs) #每轮都用当前的输入去draft模型预测
+        n_seq = len(inputs_draft)
         output_ids_draft = generate(inputs_draft, draft_params, hparams_draft['n_head'], K)
         #将draft预测的token添加到输入中
         inputs_draft += output_ids_draft
         #用target模型计算输入的logits 这里forward一遍即可
         logits_target = gpt2(inputs_draft, target_params, hparams_target['n_head'])
+        all_accepted = True
         #比较target模型的logits和draft模型的预测 确定接受才加入inputs 
         for i in range(K):
-            if np.argmax(logits_target[-(K+1)+i]) != output_ids_draft[i]:
+            #target预测的id
+            target_pred_id = int(np.argmax(logits_target[n_seq-1+i]))
+            if target_pred_id != output_ids_draft[i]:
                 #使用Greedy Sampling：如果不一致 就把target模型预测概率最大的词添加到inputs中 
-                inputs.append(int(np.argmax(logits_target[-K+i])))
-                results.append(int(np.argmax(logits_target[-K+i])))
+                inputs.append(target_pred_id)
+                results.append(target_pred_id)
+                all_accepted = False
                 break
             else:
                 #如果一致 就把draft模型预测的token添加到输入中 继续下一轮预测
@@ -259,7 +264,7 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
                 if len(results) >= n_tokens_to_generate:
                     break
         #Bonus Token: 如果draft模型的预测完全被target模型接受 那么还可以把target模型预测的直接加入inputs中 这样就不需要等到下一轮了 直接在当前轮就可以生成更多的token
-        if len(results) < n_tokens_to_generate and np.argmax(logits_target[-2]) == output_ids_draft[-1]:
+        if len(results) < n_tokens_to_generate and all_accepted == True:
             inputs.append(int(np.argmax(logits_target[-1])))
             results.append(int(np.argmax(logits_target[-1])))   
     #generated_ids = []
@@ -287,7 +292,7 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", m
     # generate output ids
     start = time.time()
     #实现投机sampling 
-    output_ids = greedy_speculative_generate(input_ids, draft_params, target_params, hparams_draft, hparams_target, n_tokens_to_generate, K=1)
+    output_ids = greedy_speculative_generate(input_ids, draft_params, target_params, hparams_draft, hparams_target, n_tokens_to_generate, K=4)
     #output_ids = generate(input_ids, params, hparams["n_head"], n_tokens_to_generate)
     end = time.time()
     print(f"Time taken to generate {n_tokens_to_generate} tokens: {end - start:.2f}s")
