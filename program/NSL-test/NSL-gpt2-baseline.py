@@ -223,7 +223,7 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
         Task: Load 124M and 1558M models at the same time, use greedy sampling, and complete speculative decoding
     
         Inputs:
-            inputs (list): The initial list of token IDs from the prompt. 
+            inputs (list): The initial list of token IDs from the prompt.
             draft_params, target_params: Model weights for the draft and target models.
             hparams_draft, hparams_target: Hyperparameters for both models.
             n_tokens_to_generate (int): The number of new tokens to generate.
@@ -233,44 +233,13 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
             list: A list of newly generated token IDs.
             
     """
-    #先load入两个模型的参数和params
-    draft_params = params_to_torch(draft_params)
-    target_params = params_to_torch(target_params)
-    results = []
-    while len(results) < n_tokens_to_generate   :
-        #添加一个inputs_draft 用于draft模型的输入 这样就可以避免直接修改inputs 这样就不需要rollback了
-        inputs_draft = list(inputs) #每轮都用当前的输入去draft模型预测
-        n_seq = len(inputs_draft)
-        output_ids_draft = generate(inputs_draft, draft_params, hparams_draft['n_head'], K)
-        #将draft预测的token添加到输入中
-        inputs_draft += output_ids_draft
-        #用target模型计算输入的logits 这里forward一遍即可
-        logits_target = gpt2(inputs_draft, target_params, hparams_target['n_head'])
-        all_accepted = True
-        #比较target模型的logits和draft模型的预测 确定接受才加入inputs 
-        for i in range(K):
-            #target预测的id
-            target_pred_id = int(np.argmax(logits_target[n_seq-1+i]))
-            if target_pred_id != output_ids_draft[i]:
-                #使用Greedy Sampling：如果不一致 就把target模型预测概率最大的词添加到inputs中 
-                inputs.append(target_pred_id)
-                results.append(target_pred_id)
-                all_accepted = False
-                break
-            else:
-                #如果一致 就把draft模型预测的token添加到输入中 继续下一轮预测
-                inputs.append(output_ids_draft[i])
-                results.append(output_ids_draft[i])
-                if len(results) >= n_tokens_to_generate:
-                    break
-        #Bonus Token: 如果draft模型的预测完全被target模型接受 那么还可以把target模型预测的直接加入inputs中 这样就不需要等到下一轮了 直接在当前轮就可以生成更多的token
-        if len(results) < n_tokens_to_generate and all_accepted == True:
-            inputs.append(int(np.argmax(logits_target[-1])))
-            results.append(int(np.argmax(logits_target[-1])))   
-    #generated_ids = []
-    #current_inputs = list(inputs)  
-    #return generated_ids
-    return results[:n_tokens_to_generate]
+    generated_ids = []
+    current_inputs = list(inputs)
+
+    while len(generated_ids) < n_tokens_to_generate:
+        pass
+
+    return generated_ids
 
 
 def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", models_dir: str = "models"):
@@ -278,22 +247,18 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", m
 
     # load encoder, hparams, and params from the released open-ai gpt-2 files
     encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
-    draft_model_size = "124M"
-    target_model_size = "1558M"
-    encoder, hparams_draft, draft_params = load_encoder_hparams_and_params(draft_model_size, models_dir)
-    _, hparams_target, target_params = load_encoder_hparams_and_params(target_model_size, models_dir)
+
     #转换
-    #params = params_to_torch(params)
+    params = params_to_torch(params)
     # encode the input string using the BPE tokenizer
     input_ids = encoder.encode(prompt)
+
     # make sure we are not surpassing the max sequence length of our model
     assert len(input_ids) + n_tokens_to_generate < hparams["n_ctx"]
 
     # generate output ids
     start = time.time()
-    #实现投机sampling 
-    output_ids = greedy_speculative_generate(input_ids, draft_params, target_params, hparams_draft, hparams_target, n_tokens_to_generate, K=4)
-    #output_ids = generate(input_ids, params, hparams["n_head"], n_tokens_to_generate)
+    output_ids = generate(input_ids, params, hparams["n_head"], n_tokens_to_generate)
     end = time.time()
     print(f"Time taken to generate {n_tokens_to_generate} tokens: {end - start:.2f}s")
 
